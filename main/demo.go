@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 
-	_ "github.com/go-kivik/couchdb/v3"
 	uuid "github.com/satori/go.uuid"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 )

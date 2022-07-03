@@ -7,10 +7,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/go-kivik/kivik/v3"
 	uuid "github.com/satori/go.uuid"
 	"google.golang.org/protobuf/encoding/protojson"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // ProtoStore is the gateway to the database and knows how to access
@@ -23,7 +26,7 @@ import (
 // of the application, BoundProtoStore to the lifecycle of a single
 // request.
 type ProtoStore struct {
-	client *kivik.Client
+	client *mongo.Client
 }
 
 func NewProtoStoreFromEnv() ProtoStore {
@@ -37,7 +40,8 @@ func NewProtoStoreFromEnv() ProtoStore {
 }
 
 func NewProtoStore(dbConnectionString string) ProtoStore {
-	client, err := kivik.New("couch", dbConnectionString)
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
+
 	if err != nil {
 		panic(err)
 	}
@@ -89,18 +93,15 @@ func (p *BoundProtoStore) Store(message protoreflect.ProtoMessage) (string, erro
 	doc["type"] = message.ProtoReflect().Descriptor().FullName()
 	doc["typeVersion"] = 1
 	doc["createdBy"] = p.user.ID
-	rev, err := p.db(p.user.Realm).Put(p.ctx, docId, doc)
-	return rev, err
+	// rev, err := p.db(p.user.Realm).Put(p.ctx, docId, doc)
+	// TODO
+	return "", nil
 }
 
 func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters ...map[string]interface{}) []protoreflect.ProtoMessage {
 	tableName := model().ProtoReflect().Descriptor().FullName()
 
-	selector := map[string]interface{}{
-		"type": map[string]interface{}{
-			"$eq": tableName,
-		},
-	}
+	selector := map[string]interface{}{}
 
 	// merge in the filters
 	for _, filter := range filters {
@@ -117,7 +118,8 @@ func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters
 	if err != nil {
 		log.Fatalf("could not encode query: %v", err)
 	}
-	rows, err := p.db(p.user.Realm).Find(p.ctx, encoded)
+	db := p.db(p.user.Realm)
+	rows, err := db.Collection(string(tableName)).Find(p.ctx, encoded)
 	if err != nil {
 		log.Fatalf("Could not read table %s: %v", tableName, err)
 	}
@@ -127,13 +129,14 @@ func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters
 	}
 
 	res := make([]protoreflect.ProtoMessage, 0)
+	var results []bson.M
 
-	for rows.Next() {
-		var doc map[string]interface{}
-		if err := rows.ScanDoc(&doc); err != nil {
-			panic(err)
-		}
+	err = rows.All(p.ctx, &results)
+	if err != nil {
+		panic(err)
+	}
 
+	for _, doc := range results {
 		doc["id"] = toIdWithRev(doc)
 
 		jsonEncoded, err := json.Marshal(doc)
@@ -179,14 +182,15 @@ func (p *BoundProtoStore) Get(model func() protoreflect.ProtoMessage, id string)
 
 // db returns the database with the given name. If it does not
 // exist, it creates it on the fly.
-func (p *BoundProtoStore) db(name string) *kivik.DB {
-	db := p.protoStore.client.DB(p.ctx, name)
-	if db.Err() != nil {
-		err := p.protoStore.client.CreateDB(p.ctx, name)
-		if err != nil {
-			log.Fatalf("Could not create database %s: %v", name, err)
-		}
-	}
+func (p *BoundProtoStore) db(name string) *mongo.Database {
+
+	db := p.protoStore.client.Database(name)
+	// if db.Err() != nil {
+	// 	err := p.protoStore.client.CreateDB(p.ctx, name)
+	// 	if err != nil {
+	// 		log.Fatalf("Could not create database %s: %v", name, err)
+	// 	}
+	// }
 	return db
 }
 
