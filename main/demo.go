@@ -29,21 +29,25 @@ func main() {
 	s := NewProtoStoreFromEnv()
 	store := s.Bind(ctx, &currentUser)
 
-	store.Store(&p)
+	id, err := store.Store(&p)
+	if err != nil {
+		log.Fatalf("could not insert: %v", err)
+	}
+	log.Printf("inserted new, with id: %s", id)
 
 	persons := store.Filter(person,
-		Eq("name", "Tom22"),
-	)
+		Eq("name", "Tom22"))
 
 	for _, person := range persons {
 		if p, ok := person.(*Person); ok {
 			log.Printf("%s: %s", p.Id, p.Name)
 		}
 	}
-	log.Println(len(persons))
+	if len(persons) == 0 {
+		log.Fatalf("Could not query filter persons (returned len(0))")
+	}
 
 	if p, ok := persons[0].(*Person); ok {
-
 		foundPerson, ok := store.Get(person, p.Id)
 		if ok {
 			log.Printf("Found person by id: %v", foundPerson)
@@ -52,11 +56,11 @@ func main() {
 		}
 
 		p.Name = "Updated name"
-		rev, err := store.Store(p)
+		id, err := store.Store(p)
 		if err != nil {
 			log.Fatalf("could not update: %v", err)
 		}
-		log.Printf("stored with rev %s", rev)
-
+		log.Printf("updated entry with id %s", id)
 	}
+
 }

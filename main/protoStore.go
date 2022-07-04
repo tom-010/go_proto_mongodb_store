@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
-	"strings"
 
-	uuid "github.com/satori/go.uuid"
 	"google.golang.org/protobuf/encoding/protojson"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -40,7 +40,10 @@ func NewProtoStoreFromEnv() ProtoStore {
 }
 
 func NewProtoStore(dbConnectionString string) ProtoStore {
-	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017").SetAuth(options.Credential{
+		Username: "admin",
+		Password: "admin",
+	}))
 
 	if err != nil {
 		panic(err)
@@ -74,52 +77,58 @@ func (p *BoundProtoStore) Store(message protoreflect.ProtoMessage) (string, erro
 
 	doc := toMap(message)
 
-	var docId string = ""
-	if val, ok := doc["id"]; ok {
-		if id, ok := val.(string); ok {
-			parts := strings.Split(id, ":")
-			docId = parts[0]
-			if len(parts) > 1 {
-				doc["_rev"] = parts[1]
+	table := message.ProtoReflect().Descriptor().FullName()
+	existingIdSet := false
+	if id, ok := doc["id"]; ok {
+		if idS, ok := id.(string); ok {
+			objectId, err := primitive.ObjectIDFromHex(idS)
+			if err != nil {
+				log.Fatalf("could not create ObjectId from %s: %v", idS, err)
 			}
+			doc["_id"] = objectId
+			existingIdSet = true
+		} else {
+			log.Fatalf("the current id is no string: %v", id)
 		}
 	}
 
-	if docId == "" {
-		docId = uuid.NewV4().String()
+	if !existingIdSet {
+		doc["_id"] = primitive.NewObjectID()
 	}
 
-	doc["id"] = docId
-	doc["type"] = message.ProtoReflect().Descriptor().FullName()
-	doc["typeVersion"] = 1
+	doc["type"] = fmt.Sprintf("%s:%d", string(table), 1)
 	doc["createdBy"] = p.user.ID
-	// rev, err := p.db(p.user.Realm).Put(p.ctx, docId, doc)
-	// TODO
-	return "", nil
+
+	opts := options.Update().SetUpsert(true)
+	_, err := p.db(p.user.Realm).Collection(string(table)).UpdateByID(p.ctx, doc["_id"], bson.D{bson.E{Key: "$set", Value: doc}}, opts)
+	if err != nil {
+		log.Fatalf("Could not insert document: %v", err)
+	}
+
+	id := doc["_id"]
+
+	if r, ok := id.(primitive.ObjectID); ok {
+		return r.Hex(), nil
+	}
+
+	return "", fmt.Errorf("id was not of type []byte, but %v", id)
 }
 
-func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters ...map[string]interface{}) []protoreflect.ProtoMessage {
+func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters ...bson.D) []protoreflect.ProtoMessage {
 	tableName := model().ProtoReflect().Descriptor().FullName()
 
-	selector := map[string]interface{}{}
-
-	// merge in the filters
-	for _, filter := range filters {
-		for k, v := range filter {
-			selector[k] = v
-		}
+	filter := bson.D{}
+	if len(filters) > 1 { // a $and with Value: [] is always false
+		filter = bson.D{bson.E{Key: "$and", Value: filters}}
+	} else if len(filters) == 1 {
+		filter = filters[0]
 	}
 
-	query := map[string]interface{}{
-		"selector": selector,
-	}
-	encoded, err := json.Marshal(query)
+	log.Println(filter)
 
-	if err != nil {
-		log.Fatalf("could not encode query: %v", err)
-	}
 	db := p.db(p.user.Realm)
-	rows, err := db.Collection(string(tableName)).Find(p.ctx, encoded)
+	rows, err := db.Collection(string(tableName)).Find(p.ctx, filter)
+
 	if err != nil {
 		log.Fatalf("Could not read table %s: %v", tableName, err)
 	}
@@ -133,12 +142,11 @@ func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters
 
 	err = rows.All(p.ctx, &results)
 	if err != nil {
-		panic(err)
+		log.Fatalf("could do a .All call to mongodb: %v", err)
 	}
 
 	for _, doc := range results {
-		doc["id"] = toIdWithRev(doc)
-
+		doc["id"] = doc["_id"]
 		jsonEncoded, err := json.Marshal(doc)
 		if err != nil {
 			log.Fatalf("Could not reencode json")
@@ -153,24 +161,17 @@ func (p *BoundProtoStore) Filter(model func() protoreflect.ProtoMessage, filters
 	return res
 }
 
-func toIdWithRev(doc map[string]interface{}) string {
-	var res string
-	if v, ok := doc["_id"].(string); ok {
-		res += v
-	}
-	if v, ok := doc["_rev"].(string); ok {
-		res += ":" + v
-	}
-	return res
-}
-
 func (p *BoundProtoStore) All(model func() protoreflect.ProtoMessage) []protoreflect.ProtoMessage {
 	return p.Filter(model)
 }
 
 func (p *BoundProtoStore) Get(model func() protoreflect.ProtoMessage, id string) (protoreflect.ProtoMessage, bool) {
 
-	models := p.Filter(model, Eq("id", strings.Split(id, ":")[0]))
+	oid, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		log.Fatalf("Could not decode object-id %s: %v", id, err)
+	}
+	models := p.Filter(model, bson.D{bson.E{Key: "_id", Value: oid}})
 	if len(models) < 1 {
 		return nil, false
 	}
@@ -183,14 +184,7 @@ func (p *BoundProtoStore) Get(model func() protoreflect.ProtoMessage, id string)
 // db returns the database with the given name. If it does not
 // exist, it creates it on the fly.
 func (p *BoundProtoStore) db(name string) *mongo.Database {
-
 	db := p.protoStore.client.Database(name)
-	// if db.Err() != nil {
-	// 	err := p.protoStore.client.CreateDB(p.ctx, name)
-	// 	if err != nil {
-	// 		log.Fatalf("Could not create database %s: %v", name, err)
-	// 	}
-	// }
 	return db
 }
 
@@ -204,10 +198,14 @@ func toMap(message protoreflect.ProtoMessage) map[string]interface{} {
 	return res
 }
 
-func Eq(col string, value interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		col: map[string]interface{}{
-			"$eq": value,
+func Eq(col string, value interface{}) bson.D {
+	return bson.D{
+		bson.E{Key: "$and",
+			Value: bson.A{
+				bson.D{
+					bson.E{Key: col, Value: bson.D{bson.E{Key: "$eq", Value: value}}},
+				},
+			},
 		},
 	}
 }
